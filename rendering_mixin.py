@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import re
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from .daily_shared import WEEKDAY_CN
 
@@ -84,6 +85,7 @@ class RenderingMixin:
             raw_summary = item.get("summary", "").strip()
             summary = self._news_summary_text(title, raw_summary)
             link = item.get("link", "").strip()
+            safe_link = self._safe_markdown_link_url(link)
 
             headline = title or summary
             if not headline:
@@ -95,10 +97,25 @@ class RenderingMixin:
             lines.append(headline)
             if summary:
                 lines.append(summary)
-            if link:
-                lines.append(f"- [来源]({link})")
+            if safe_link:
+                lines.append(f"- [来源]({safe_link})")
             else:
                 lines.append("- 来源")
+
+    @staticmethod
+    def _safe_markdown_link_url(link: str) -> str:
+        value = link.strip()
+        if not value:
+            return ""
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            return ""
+        if any(char.isspace() for char in parts.netloc):
+            return ""
+        path = quote(parts.path or "/", safe="/%:@!$&'*+,;=-._~")
+        query = quote(parts.query, safe="=&%:@!$'*,;+-._~")
+        fragment = quote(parts.fragment, safe="%:@!$&'*,;=+-._~")
+        return urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
 
     def _news_summary_text(self, title: str, summary: str) -> str:
         summary = summary.strip()

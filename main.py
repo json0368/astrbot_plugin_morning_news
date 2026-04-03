@@ -107,11 +107,16 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _set_city_impl(self, event: AstrMessageEvent, city: str):
-        updated = await self._set_subscription_city(event, city.strip())
+        city = city.strip()
+        if not city:
+            yield event.plain_result("天气城市不能为空，请使用 `/daily city 城市名`。")
+            return
+
+        updated = await self._set_subscription_city(event, city)
         if updated is None:
             yield event.plain_result("当前会话还没有订阅，请先执行 `/daily subscribe`。")
             return
-        yield event.plain_result(f"当前会话的天气城市已设置为: {city.strip()}")
+        yield event.plain_result(f"当前会话的天气城市已设置为: {city}")
 
     @daily.command("preview")
     async def preview(self, event: AstrMessageEvent, city: str = ""):
@@ -218,6 +223,7 @@ class DailyMorningReportPlugin(
     async def _sendnow_impl(self, event: AstrMessageEvent):
         success_count = await self._broadcast_daily_report(reason="manual")
         yield event.plain_result(f"晨报已尝试发送，成功投递到 {success_count} 个会话。")
+
     async def _broadcast_daily_report(self, reason: str) -> int:
         subscriptions = await self._get_subscription_snapshot()
         if not subscriptions:
@@ -225,34 +231,40 @@ class DailyMorningReportPlugin(
             return 0
 
         payload_cache: dict[str, dict[str, Any]] = {}
-        success_count = 0
-
-        for unified_msg_origin, info in subscriptions.items():
+        for _, info in subscriptions.items():
             city = (info.get("city") or self._default_city()).strip()
             cache_key = city or "__default__"
-            if cache_key not in payload_cache:
-                try:
-                    payload_cache[cache_key] = await self._build_report_payload(city)
-                except Exception as exc:
-                    logger.exception("晨报内容构建失败: city=%s error=%s", city, exc)
-                    fallback_report = self._fallback_report()
-                    payload_cache[cache_key] = {
-                        "mode": "text",
-                        "text": fallback_report,
-                        "content": fallback_report,
-                    }
-
+            if cache_key in payload_cache:
+                continue
             try:
-                if await self._deliver_payload_to_subscription(unified_msg_origin, payload_cache[cache_key], info):
-                    success_count += 1
+                payload_cache[cache_key] = await self._build_report_payload(city)
             except Exception as exc:
-                logger.warning(
-                    "晨报发送失败: reason=%s target=%s error=%s",
-                    reason,
-                    unified_msg_origin,
-                    exc,
-                )
+                logger.exception("晨报内容构建失败: city=%s error=%s", city, exc)
+                fallback_report = self._fallback_report()
+                payload_cache[cache_key] = {
+                    "mode": "text",
+                    "text": fallback_report,
+                    "content": fallback_report,
+                }
 
+        semaphore = asyncio.Semaphore(self._broadcast_send_concurrency())
+        tasks: list[asyncio.Task[bool]] = []
+        for unified_msg_origin, info in subscriptions.items():
+            cache_key = ((info.get("city") or self._default_city()).strip() or "__default__")
+            tasks.append(
+                asyncio.create_task(
+                    self._deliver_subscription_with_semaphore(
+                        semaphore,
+                        reason,
+                        unified_msg_origin,
+                        payload_cache[cache_key],
+                        info,
+                    )
+                )
+            )
+
+        results = await asyncio.gather(*tasks)
+        success_count = sum(1 for result in results if result)
         logger.info("晨报发送完成: reason=%s success=%s", reason, success_count)
         return success_count
 
@@ -298,15 +310,28 @@ class DailyMorningReportPlugin(
     def _build_message_chain(self, payload: dict[str, Any]) -> MessageChain:
         return MessageChain().message(self._payload_text(payload))
 
-    async def _build_report(self, city: str = "") -> str:
-        async with self._http_client() as client:
-            report_data = await self._collect_report_data_with_client(client, city)
-        return self._render_report_text(report_data)
+    def _broadcast_send_concurrency(self) -> int:
+        return 4
 
-    async def _build_news_text(self) -> str:
-        async with self._http_client() as client:
-            news_data = await self._collect_news_data_with_client(client)
-        return self._render_news_text(news_data)
+    async def _deliver_subscription_with_semaphore(
+        self,
+        semaphore: asyncio.Semaphore,
+        reason: str,
+        unified_msg_origin: str,
+        payload: dict[str, Any],
+        info: dict[str, Any],
+    ) -> bool:
+        async with semaphore:
+            try:
+                return await self._deliver_payload_to_subscription(unified_msg_origin, payload, info)
+            except Exception as exc:
+                logger.warning(
+                    "晨报发送失败: reason=%s target=%s error=%s",
+                    reason,
+                    unified_msg_origin,
+                    exc,
+                )
+                return False
 
     async def _build_status_data(self, event: AstrMessageEvent) -> dict[str, Any]:
         subscriptions = await self._get_subscription_snapshot()

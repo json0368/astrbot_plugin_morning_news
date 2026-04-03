@@ -88,7 +88,7 @@ class WeatherMixin:
     async def _fetch_open_meteo_weather_summary(self, client: httpx.AsyncClient, city_name: str) -> str | None:
         geo = await self._fetch_city_geo(client, city_name)
         if not geo:
-            return f"{city_name}: \u6682\u65f6\u65e0\u6cd5\u89e3\u6790\u57ce\u5e02\u5750\u6807\u3002"
+            return f"{city_name}: 暂时无法解析城市坐标。"
 
         response = await client.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -116,7 +116,7 @@ class WeatherMixin:
                 or self._clean_text(str(data.get("province", "") or ""))
                 or city_name
             ),
-            "weather_text": self._clean_text(str(data.get("weather", "") or "")) or "????",
+            "weather_text": self._clean_text(str(data.get("weather", "") or "")) or "未知天气",
             "temp_min": self._safe_float(data.get("temp_min")),
             "temp_max": self._safe_float(data.get("temp_max")),
             "current_temp": self._safe_float(data.get("temperature")),
@@ -141,7 +141,7 @@ class WeatherMixin:
         weather_code = self._safe_int(self._first_or_default(daily.get("weather_code"), current.get("weather_code")))
         return {
             "location_name": geo.get("display_name") or city_name,
-            "weather_text": WEATHER_CODE_MAP.get(weather_code, "????") if weather_code is not None else "????",
+            "weather_text": WEATHER_CODE_MAP.get(weather_code, "未知天气") if weather_code is not None else "未知天气",
             "temp_min": self._safe_float(self._first_or_default(daily.get("temperature_2m_min"))),
             "temp_max": self._safe_float(self._first_or_default(daily.get("temperature_2m_max"))),
             "current_temp": self._safe_float(current.get("temperature_2m")),
@@ -157,7 +157,7 @@ class WeatherMixin:
 
     def _render_weather_summary(self, fields: dict[str, Any]) -> str:
         location_name = str(fields.get("location_name") or "").strip()
-        weather_text = str(fields.get("weather_text") or "????").strip() or "????"
+        weather_text = str(fields.get("weather_text") or "未知天气").strip() or "未知天气"
         parts = [f"{location_name}: {weather_text}"]
 
         temp_min = fields.get("temp_min")
@@ -173,27 +173,27 @@ class WeatherMixin:
         aqi_category = str(fields.get("aqi_category") or "").strip()
 
         if temp_min is not None and temp_max is not None:
-            parts.append(f"{round(temp_min)}~{round(temp_max)}?C")
+            parts.append(f"{round(temp_min)}~{round(temp_max)}°C")
         if current_temp is not None:
-            parts.append(f"?? {round(current_temp)}?C")
+            parts.append(f"当前 {round(current_temp)}°C")
         if humidity:
-            parts.append(f"?? {humidity}%")
+            parts.append(f"湿度 {humidity}%")
         if wind_text:
             parts.append(wind_text)
         if feels_like is not None:
-            parts.append(f"?? {round(feels_like)}?C")
+            parts.append(f"体感 {round(feels_like)}°C")
         if rain_probability is not None:
-            parts.append(f"???? {round(rain_probability)}%")
+            parts.append(f"降水概率 {round(rain_probability)}%")
         if sunrise:
-            parts.append(f"?? {sunrise}")
+            parts.append(f"日出 {sunrise}")
         if sunset:
-            parts.append(f"?? {sunset}")
+            parts.append(f"日落 {sunset}")
         if aqi_text:
             aqi_summary = f"AQI {aqi_text}"
             if aqi_category:
                 aqi_summary = f"{aqi_summary} {aqi_category}"
             parts.append(aqi_summary)
-        return "?".join(parts)
+        return "，".join(parts)
 
     def _weather_wind_text(self, direction: Any, power: Any) -> str:
         wind_direction = self._clean_text(str(direction or ""))
@@ -283,7 +283,7 @@ class WeatherMixin:
                 connection.putheader(name, value)
             connection.endheaders()
             response = connection.getresponse()
-            body = response.read()
+            body = self._read_limited_response_body(response, self._custom_weather_max_response_bytes())
             response_headers = {key.lower(): value for key, value in response.getheaders()}
             return _PinnedHttpResponse(response.status, response_headers, body)
         finally:
@@ -292,6 +292,26 @@ class WeatherMixin:
     def _custom_weather_timeout_seconds(self) -> int:
         config = getattr(self, "config", {}) or {}
         return max(int(config.get("http_timeout_seconds", 15) or 15), 5)
+
+    def _dns_resolution_timeout_seconds(self) -> int:
+        return max(1, min(self._custom_weather_timeout_seconds(), 10))
+
+    def _custom_weather_max_response_bytes(self) -> int:
+        return 262144
+
+    @staticmethod
+    def _read_limited_response_body(response: Any, max_bytes: int) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        chunk_size = min(65536, max_bytes + 1)
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"custom weather api response too large: {total} bytes")
+            chunks.append(chunk)
 
     @staticmethod
     def _sanitize_pinned_request_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -323,11 +343,14 @@ class WeatherMixin:
 
     async def _resolve_hostname_ips(self, hostname: str) -> set[str]:
         loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(
-            hostname,
-            None,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(
+                hostname,
+                None,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+            ),
+            timeout=self._dns_resolution_timeout_seconds(),
         )
         return {
             sockaddr[0]
@@ -371,6 +394,8 @@ class WeatherMixin:
         except ValueError:
             try:
                 resolved_ips = await self._resolve_hostname_ips(hostname)
+            except asyncio.TimeoutError as exc:
+                raise ValueError(f"custom weather api hostname resolution timed out: {hostname}") from exc
             except OSError as exc:
                 raise ValueError(f"custom weather api hostname resolution failed: {hostname}") from exc
             if not resolved_ips:

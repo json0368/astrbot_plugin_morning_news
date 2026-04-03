@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import html
@@ -102,13 +102,40 @@ class NewsMixin:
         try:
             response = await client.get(url)
             response.raise_for_status()
+            text_body = self._rss_response_text(response)
             loop = asyncio.get_running_loop()
-            feed = await loop.run_in_executor(None, feedparser.parse, response.text)
+            feed = await loop.run_in_executor(None, feedparser.parse, text_body)
             source = self._clean_text(feed.feed.get("title", "") or "")
             return source, list(feed.entries)
         except Exception as exc:
             logger.warning("rss fetch failed: url=%s error=%s", url, exc)
             return "", []
+
+    def _rss_response_max_bytes(self) -> int:
+        return 1048576
+
+    def _rss_response_text(self, response: Any) -> str:
+        headers = getattr(response, "headers", {}) or {}
+        content_length = headers.get("content-length") if isinstance(headers, dict) else None
+        if content_length is not None:
+            try:
+                if int(content_length) > self._rss_response_max_bytes():
+                    raise ValueError(f"rss response too large: {content_length} bytes")
+            except ValueError:
+                if str(content_length).isdigit():
+                    raise
+
+        raw_content = getattr(response, "content", None)
+        if isinstance(raw_content, (bytes, bytearray)):
+            if len(raw_content) > self._rss_response_max_bytes():
+                raise ValueError(f"rss response too large: {len(raw_content)} bytes")
+            return response.text
+
+        text_body = str(getattr(response, "text", "") or "")
+        text_size = len(text_body.encode("utf-8", errors="ignore"))
+        if text_size > self._rss_response_max_bytes():
+            raise ValueError(f"rss response too large: {text_size} bytes")
+        return text_body
 
     async def _persist_news_cache(self, news: list[dict[str, str]]):
         async with self._news_cache_lock:

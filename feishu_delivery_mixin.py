@@ -1,7 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import importlib
 import json
+import threading
 import uuid
 from typing import Any
 
@@ -10,6 +11,7 @@ from astrbot.api.event import MessageChain
 
 
 _LARK_IM_V1_MODULE: Any | None = None
+_LARK_IM_V1_LOCK = threading.Lock()
 
 
 class FeishuDeliveryMixin:
@@ -74,15 +76,25 @@ class FeishuDeliveryMixin:
         if callable(stop_event):
             try:
                 stop_event()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_event_hook_failure("stop_event", exc)
 
         should_call_llm = getattr(event, "should_call_llm", None)
         if callable(should_call_llm):
             try:
                 should_call_llm(True)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_event_hook_failure("should_call_llm", exc)
+
+    @staticmethod
+    def _log_event_hook_failure(hook_name: str, exc: Exception):
+        log_method = getattr(logger, "debug", None) or logger.warning
+        log_method("事件处理钩子执行失败: hook=%s error=%s", hook_name, exc)
+
+    @staticmethod
+    def _log_sdk_path_failure(stage: str, exc: Exception):
+        log_method = getattr(logger, "debug", None) or logger.warning
+        log_method("飞书 SDK 路径调用失败: stage=%s error=%s", stage, exc)
 
     def _transport_snapshot_from_event(self, event: Any) -> dict[str, str]:
         snapshot: dict[str, str] = {}
@@ -117,8 +129,8 @@ class FeishuDeliveryMixin:
                 value = getter()
                 if value:
                     return str(value)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_event_hook_failure("get_platform_id", exc)
 
         for candidate in (
             getattr(event, "platform_id", None),
@@ -397,10 +409,14 @@ class FeishuDeliveryMixin:
         global _LARK_IM_V1_MODULE
         if _LARK_IM_V1_MODULE is not None:
             return _LARK_IM_V1_MODULE
-        try:
-            _LARK_IM_V1_MODULE = importlib.import_module("lark_oapi.api.im.v1")
-        except Exception:
-            return None
+        with _LARK_IM_V1_LOCK:
+            if _LARK_IM_V1_MODULE is not None:
+                return _LARK_IM_V1_MODULE
+            try:
+                _LARK_IM_V1_MODULE = importlib.import_module("lark_oapi.api.im.v1")
+            except Exception as exc:
+                FeishuDeliveryMixin._log_sdk_path_failure("import_im_v1_module", exc)
+                return None
         return _LARK_IM_V1_MODULE
 
     @staticmethod
@@ -432,7 +448,8 @@ class FeishuDeliveryMixin:
                 )
                 .build()
             )
-        except Exception:
+        except Exception as exc:
+            FeishuDeliveryMixin._log_sdk_path_failure("build_card_request", exc)
             return None
         return request
 
