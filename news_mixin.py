@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import html
@@ -49,22 +49,31 @@ class NewsMixin:
         await self._set_news_cache(items)
         return items
 
+    async def _cancel_news_refresh_task(self):
+        refresh_task = getattr(self, "_news_refresh_task", None)
+        if refresh_task is None:
+            return
+        self._news_refresh_task = None
+        if refresh_task.done():
+            return
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+
     async def _fetch_headlines_uncached(self, client: httpx.AsyncClient) -> list[dict[str, str]]:
         news_limit = self._news_limit()
         items: list[dict[str, str]] = []
         seen_titles: set[str] = set()
+        rss_urls = self._rss_urls()
+        if not rss_urls:
+            return items
 
-        for url in self._rss_urls():
-            try:
-                response = await client.get(url)
-                response.raise_for_status()
-                feed = feedparser.parse(response.text)
-                source = self._clean_text(feed.feed.get("title", "") or "")
-            except Exception as exc:
-                logger.warning("rss fetch failed: url=%s error=%s", url, exc)
-                continue
+        feeds = await asyncio.gather(*(self._fetch_rss_feed(client, url) for url in rss_urls))
 
-            for entry in feed.entries:
+        for source, entries in feeds:
+            for entry in entries:
                 title = self._clip_text(self._clean_text(entry.get("title", "") or ""), 80)
                 if not title:
                     continue
@@ -88,6 +97,17 @@ class NewsMixin:
                     return items
 
         return items
+
+    async def _fetch_rss_feed(self, client: httpx.AsyncClient, url: str) -> tuple[str, list[Any]]:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            feed = feedparser.parse(response.text)
+            source = self._clean_text(feed.feed.get("title", "") or "")
+            return source, list(feed.entries)
+        except Exception as exc:
+            logger.warning("rss fetch failed: url=%s error=%s", url, exc)
+            return "", []
 
     async def _persist_news_cache(self, news: list[dict[str, str]]):
         async with self._news_cache_lock:
@@ -255,7 +275,7 @@ class NewsMixin:
 
         meta_parts = []
         if title:
-            meta_parts.append(f"\u300a{title}\u300b")
+            meta_parts.append(f"《{title}》")
         if author:
             meta_parts.append(author)
         meta = " ".join(meta_parts)

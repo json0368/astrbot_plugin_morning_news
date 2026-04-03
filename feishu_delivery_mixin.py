@@ -1,8 +1,8 @@
 ﻿from __future__ import annotations
 
 import importlib
-import inspect
 import json
+import uuid
 from typing import Any
 
 from astrbot.api import logger
@@ -12,10 +12,7 @@ from astrbot.api.event import MessageChain
 class FeishuDeliveryMixin:
     async def _deliver_payload_to_event(self, event: Any, payload: dict[str, Any]) -> Any | None:
         if self._payload_has_card(payload) and self._is_feishu_event(event):
-            transport = self._transport_snapshot_from_event(event)
             event_error: Exception | None = None
-            context_error: Exception | None = None
-
             try:
                 if await self._send_feishu_card_with_event(event, payload["card"]):
                     self._mark_event_as_handled(event)
@@ -23,23 +20,10 @@ class FeishuDeliveryMixin:
             except Exception as exc:
                 event_error = exc
 
-            if transport:
-                try:
-                    if await self._send_feishu_card_to_subscription(
-                        getattr(event, "unified_msg_origin", ""),
-                        transport,
-                        payload["card"],
-                    ):
-                        self._mark_event_as_handled(event)
-                        return None
-                except Exception as exc:
-                    context_error = exc
-
-            if event_error or context_error:
+            if event_error is not None:
                 logger.warning(
-                    "飞书卡片发送失败，回退纯文本: event_error=%s context_error=%s",
+                    "飞书卡片发送失败，回退纯文本: scope=event event_error=%s",
                     event_error,
-                    context_error,
                 )
         return event.plain_result(self._payload_text(payload))
 
@@ -60,7 +44,7 @@ class FeishuDeliveryMixin:
                     return True
             except Exception as exc:
                 logger.warning(
-                    "飞书主动卡片发送失败，回退纯文本: target=%s error=%s",
+                    "飞书主动卡片发送失败，回退纯文本: scope=subscription target=%s error=%s",
                     unified_msg_origin,
                     exc,
                 )
@@ -83,9 +67,10 @@ class FeishuDeliveryMixin:
         return bool(self.config.get("feishu_card_enabled", True))
 
     def _mark_event_as_handled(self, event: Any):
-        if hasattr(event, "_has_send_oper"):
+        stop_event = getattr(event, "stop_event", None)
+        if callable(stop_event):
             try:
-                event._has_send_oper = True
+                stop_event()
             except Exception:
                 pass
 
@@ -271,18 +256,12 @@ class FeishuDeliveryMixin:
 
     async def _send_feishu_card_with_event(self, event: Any, card: dict[str, Any]) -> bool:
         target = self._target_from_event(event)
-        if not target:
-            return False
-
-        content = json.dumps(card, ensure_ascii=False)
-        return await self._invoke_card_sender(
-            getattr(event, "_send_card_message", None),
-            getattr(event, "_send_im_message", None),
-            prefix_args=(),
-            content=content,
+        return await self._send_feishu_card_with_context(
+            scope="event",
+            platform_id=self._event_platform_id(event),
+            receive_id=target.get("receive_id", ""),
+            receive_id_type=target.get("receive_id_type", ""),
             card=card,
-            receive_id=target["receive_id"],
-            receive_id_type=target["receive_id_type"],
         )
 
     async def _send_feishu_card_to_subscription(
@@ -292,128 +271,172 @@ class FeishuDeliveryMixin:
         card: dict[str, Any],
     ) -> bool:
         target = self._target_from_subscription(unified_msg_origin, subscription)
-        if not target.get("platform_id") or not target.get("receive_id") or not target.get("receive_id_type"):
+        return await self._send_feishu_card_with_context(
+            scope="subscription",
+            platform_id=target.get("platform_id", ""),
+            receive_id=target.get("receive_id", ""),
+            receive_id_type=target.get("receive_id_type", ""),
+            card=card,
+        )
+
+    async def _send_feishu_card_with_context(
+        self,
+        *,
+        scope: str,
+        platform_id: str,
+        receive_id: str,
+        receive_id_type: str,
+        card: dict[str, Any],
+    ) -> bool:
+        if not receive_id or not receive_id_type:
+            self._log_card_capability_fallback(
+                scope=scope,
+                reason="missing_receive_target",
+                platform_id=platform_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+            )
+            return False
+        if not platform_id:
+            self._log_card_capability_fallback(
+                scope=scope,
+                reason="missing_platform_id",
+                platform_id=platform_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+            )
             return False
 
         get_platform_inst = getattr(self.context, "get_platform_inst", None)
         if not callable(get_platform_inst):
+            self._log_card_capability_fallback(
+                scope=scope,
+                reason="missing_get_platform_inst",
+                platform_id=platform_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+            )
             return False
 
-        platform_inst = get_platform_inst(target["platform_id"])
+        platform_inst = get_platform_inst(platform_id)
         if not platform_inst:
-            return False
-
-        sender = self._load_lark_sender()
-        if not sender:
+            self._log_card_capability_fallback(
+                scope=scope,
+                reason="missing_platform_instance",
+                platform_id=platform_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+            )
             return False
 
         lark_api = self._resolve_lark_api_client(platform_inst)
         if lark_api is None:
+            self._log_card_capability_fallback(
+                scope=scope,
+                reason="missing_lark_api",
+                platform_id=platform_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+            )
             return False
 
-        content = json.dumps(card, ensure_ascii=False)
-        return await self._invoke_card_sender(
-            None,
-            sender,
-            prefix_args=(lark_api,),
-            content=content,
-            card=card,
-            receive_id=target["receive_id"],
-            receive_id_type=target["receive_id_type"],
-        )
+        create_message = self._resolve_lark_message_api(lark_api)
+        if create_message is None:
+            self._log_card_capability_fallback(
+                scope=scope,
+                reason="missing_message_api",
+                platform_id=platform_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+            )
+            return False
+
+        request = self._build_lark_card_request(receive_id, receive_id_type, card)
+        if request is None:
+            self._log_card_capability_fallback(
+                scope=scope,
+                reason="missing_lark_sdk",
+                platform_id=platform_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+            )
+            return False
+
+        response = await create_message(request)
+        if hasattr(response, "success") and callable(response.success) and not response.success():
+            logger.warning(
+                "飞书卡片发送失败，回退纯文本: scope=%s reason=api_error code=%s msg=%s platform_id=%s receive_id=%s receive_id_type=%s",
+                scope,
+                getattr(response, "code", ""),
+                getattr(response, "msg", ""),
+                platform_id,
+                receive_id,
+                receive_id_type,
+            )
+            return False
+        return True
 
     @staticmethod
     def _resolve_lark_api_client(platform_inst: Any) -> Any:
         lark_api = getattr(platform_inst, "lark_api", None)
-        if lark_api is not None:
-            return lark_api
-        return None
+        return lark_api if lark_api is not None else None
 
     @staticmethod
-    def _load_lark_sender():
+    def _resolve_lark_message_api(lark_api: Any):
+        im = getattr(lark_api, "im", None)
+        v1 = getattr(im, "v1", None)
+        message = getattr(v1, "message", None)
+        create_message = getattr(message, "acreate", None)
+        return create_message if callable(create_message) else None
+
+    @staticmethod
+    def _build_lark_card_request(receive_id: str, receive_id_type: str, card: dict[str, Any]) -> Any | None:
         try:
-            module = importlib.import_module("astrbot.core.platform.sources.lark.lark_event")
+            module = importlib.import_module("lark_oapi.api.im.v1")
         except Exception:
             return None
-        event_cls = getattr(module, "LarkMessageEvent", None)
-        return getattr(event_cls, "_send_im_message", None) if event_cls else None
 
-    def _sender_accepts_call(self, sender: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
-        if not callable(sender):
-            return False
-        try:
-            signature = inspect.signature(sender)
-        except (TypeError, ValueError):
-            return True
-        try:
-            signature.bind(*args, **kwargs)
-        except TypeError:
-            return False
-        return True
+        request_cls = getattr(module, "CreateMessageRequest", None)
+        body_cls = getattr(module, "CreateMessageRequestBody", None)
+        if request_cls is None or body_cls is None:
+            return None
+        if not hasattr(request_cls, "builder") or not hasattr(body_cls, "builder"):
+            return None
 
-    async def _invoke_card_sender(
-        self,
-        card_sender: Any,
-        im_sender: Any,
+        content = json.dumps(card, ensure_ascii=False)
+        body_builder = body_cls.builder()
+        request_builder = request_cls.builder()
+        try:
+            request = (
+                request_builder.receive_id_type(receive_id_type)
+                .request_body(
+                    body_builder
+                    .receive_id(receive_id)
+                    .content(content)
+                    .msg_type("interactive")
+                    .uuid(str(uuid.uuid4()))
+                    .build()
+                )
+                .build()
+            )
+        except Exception:
+            return None
+        return request
+
+    @staticmethod
+    def _log_card_capability_fallback(
         *,
-        prefix_args: tuple[Any, ...],
-        content: str,
-        card: dict[str, Any],
+        scope: str,
+        reason: str,
+        platform_id: str,
         receive_id: str,
         receive_id_type: str,
-    ) -> bool:
-        if callable(card_sender):
-            for args, kwargs in (
-                (prefix_args, {"card": card}),
-                (prefix_args, {"content": content}),
-                (
-                    prefix_args,
-                    {
-                        "content": content,
-                        "receive_id": receive_id,
-                        "receive_id_type": receive_id_type,
-                    },
-                ),
-                (
-                    prefix_args,
-                    {
-                        "card": card,
-                        "receive_id": receive_id,
-                        "receive_id_type": receive_id_type,
-                    },
-                ),
-            ):
-                if not self._sender_accepts_call(card_sender, args, kwargs):
-                    continue
-                await card_sender(*args, **kwargs)
-                return True
-
-        if callable(im_sender):
-            for args, kwargs in (
-                (
-                    prefix_args,
-                    {
-                        "content": content,
-                        "msg_type": "interactive",
-                        "receive_id": receive_id,
-                        "receive_id_type": receive_id_type,
-                    },
-                ),
-                (
-                    prefix_args + (content, "interactive"),
-                    {
-                        "receive_id": receive_id,
-                        "receive_id_type": receive_id_type,
-                    },
-                ),
-                (
-                    prefix_args + (content, "interactive", receive_id, receive_id_type),
-                    {},
-                ),
-            ):
-                if not self._sender_accepts_call(im_sender, args, kwargs):
-                    continue
-                await im_sender(*args, **kwargs)
-                return True
-
-        return False
+    ):
+        logger.warning(
+            "飞书卡片发送能力不足，回退纯文本: scope=%s reason=%s platform_id=%s receive_id=%s receive_id_type=%s",
+            scope,
+            reason,
+            platform_id,
+            receive_id,
+            receive_id_type,
+        )

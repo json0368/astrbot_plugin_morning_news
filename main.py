@@ -4,10 +4,8 @@ import asyncio
 import html
 import json
 import re
-import sys
 from collections import OrderedDict
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -16,26 +14,13 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
-PLUGIN_DIR = Path(__file__).resolve().parent
-if str(PLUGIN_DIR) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_DIR))
-
-try:
-    from .card_rendering_mixin import CardRenderingMixin
-    from .daily_shared import GEO_CACHE_MAX_SIZE, WEEKDAY_CN
-    from .feishu_delivery_mixin import FeishuDeliveryMixin
-    from .news_mixin import NewsMixin
-    from .rendering_mixin import RenderingMixin
-    from .scheduler_mixin import SchedulerMixin
-    from .weather_mixin import WeatherMixin
-except ImportError:
-    from card_rendering_mixin import CardRenderingMixin
-    from daily_shared import GEO_CACHE_MAX_SIZE, WEEKDAY_CN
-    from feishu_delivery_mixin import FeishuDeliveryMixin
-    from news_mixin import NewsMixin
-    from rendering_mixin import RenderingMixin
-    from scheduler_mixin import SchedulerMixin
-    from weather_mixin import WeatherMixin
+from .card_rendering_mixin import CardRenderingMixin
+from .daily_shared import GEO_CACHE_MAX_SIZE, WEEKDAY_CN
+from .feishu_delivery_mixin import FeishuDeliveryMixin
+from .news_mixin import NewsMixin
+from .rendering_mixin import RenderingMixin
+from .scheduler_mixin import SchedulerMixin
+from .weather_mixin import WeatherMixin
 
 
 @register(
@@ -73,6 +58,7 @@ class DailyMorningReportPlugin(
 
     async def terminate(self):
         await self._stop_scheduler()
+        await self._cancel_news_refresh_task()
 
     @filter.command_group("daily")
     def daily(self):
@@ -467,18 +453,26 @@ class DailyMorningReportPlugin(
 
     async def _set_subscription_city(self, event: AstrMessageEvent, city: str) -> bool | None:
         changed = False
+        transport = self._transport_snapshot_from_event(event)
         async with self._state_lock:
             item = self._subscriptions.get(event.unified_msg_origin)
             if not item:
                 return None
             city_changed = item.get("city", "") != city
+            transport_changed = any(
+                value and item.get(key) != value
+                for key, value in transport.items()
+                if key in {"platform_id", "receive_id", "receive_id_type"}
+            )
+            changed = city_changed or transport_changed
+            if not changed:
+                return False
             item["city"] = city
             item["sender_name"] = event.get_sender_name()
             item["updated_at"] = datetime.now(self._timezone()).isoformat(timespec="seconds")
-            transport_changed = self._apply_subscription_transport(item, self._transport_snapshot_from_event(event))
-            changed = city_changed or transport_changed
+            self._apply_subscription_transport(item, transport)
         await self._persist_subscriptions()
-        return changed
+        return True
 
     async def _refresh_subscription_transport_if_needed(self, event: AstrMessageEvent):
         transport = self._transport_snapshot_from_event(event)
