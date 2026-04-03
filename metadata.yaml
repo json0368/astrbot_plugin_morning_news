@@ -1,0 +1,10 @@
+name: astrbot_plugin_morning_news
+display_name: 飞书每日晨报
+desc: |-
+  定时向飞书会话推送每日晨报，支持卡片展示、文本回退、订阅、预览、新闻速览、天气查询与管理员立即群发。
+version: 0.2.0
+author: json0368
+repo: https://github.com/json0368/astrbot_plugin_morning_news
+support_platforms:
+  - feishu
+astrbot_version: ">=4.16,<5"
