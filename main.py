@@ -62,6 +62,7 @@ class DailyMorningReportPlugin(
         self._news_cache: dict[str, Any] | None = None
         self._state_lock = asyncio.Lock()
         self._news_cache_lock = asyncio.Lock()
+        self._news_refresh_task: asyncio.Task | None = None
         self._scheduler_task: asyncio.Task | None = None
 
     @filter.on_astrbot_loaded()
@@ -121,7 +122,7 @@ class DailyMorningReportPlugin(
 
     async def _set_city_impl(self, event: AstrMessageEvent, city: str):
         updated = await self._set_subscription_city(event, city.strip())
-        if not updated:
+        if updated is None:
             yield event.plain_result("当前会话还没有订阅，请先执行 `/daily subscribe`。")
             return
         yield event.plain_result(f"当前会话的天气城市已设置为: {city.strip()}")
@@ -133,7 +134,7 @@ class DailyMorningReportPlugin(
 
     async def _preview_impl(self, event: AstrMessageEvent, city: str = ""):
         await self._refresh_subscription_transport_if_needed(event)
-        resolved_city = city.strip() or self._city_for_subscription(event.unified_msg_origin)
+        resolved_city = city.strip() or await self._city_for_subscription(event.unified_msg_origin)
         payload = await self._build_report_payload(resolved_city)
         result = await self._deliver_payload_to_event(event, payload)
         if result is not None:
@@ -158,7 +159,7 @@ class DailyMorningReportPlugin(
 
     async def _weather_impl(self, event: AstrMessageEvent, city: str = ""):
         await self._refresh_subscription_transport_if_needed(event)
-        resolved_city = city.strip() or self._city_for_subscription(event.unified_msg_origin)
+        resolved_city = city.strip() or await self._city_for_subscription(event.unified_msg_origin)
         if not resolved_city:
             payload = self._build_weather_payload("", "请提供城市名，或先设置默认城市 / 当前会话城市。")
             result = await self._deliver_payload_to_event(event, payload)
@@ -402,10 +403,37 @@ class DailyMorningReportPlugin(
     async def _load_subscriptions(self):
         data = await self.get_kv_data("subscriptions", {})
         if not isinstance(data, dict):
-            logger.warning("晨报插件订阅数据格式异常，已重置为空。")
+            logger.warning("morning-news subscriptions data is invalid; resetting to empty state")
             data = {}
+        normalized = self._normalize_subscriptions(data)
         async with self._state_lock:
-            self._subscriptions = data
+            self._subscriptions = normalized
+
+    def _normalize_subscriptions(self, data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        normalized: dict[str, dict[str, Any]] = {}
+        for key, value in data.items():
+            record = self._normalize_subscription_record(value)
+            if record is None:
+                logger.warning("morning-news skipped invalid subscription record: key=%s", key)
+                continue
+            normalized[str(key)] = record
+        return normalized
+
+    def _normalize_subscription_record(self, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        normalized: dict[str, Any] = {}
+        for key in (
+            "city",
+            "sender_name",
+            "updated_at",
+            "platform_id",
+            "receive_id",
+            "receive_id_type",
+        ):
+            raw = value.get(key, "")
+            normalized[key] = self._clean_text(str(raw)) if raw is not None else ""
+        return normalized
 
     async def _get_subscription_snapshot(self) -> dict[str, dict[str, Any]]:
         async with self._state_lock:
@@ -437,18 +465,20 @@ class DailyMorningReportPlugin(
             await self._persist_subscriptions()
         return removed
 
-    async def _set_subscription_city(self, event: AstrMessageEvent, city: str) -> bool:
+    async def _set_subscription_city(self, event: AstrMessageEvent, city: str) -> bool | None:
         changed = False
         async with self._state_lock:
             item = self._subscriptions.get(event.unified_msg_origin)
             if not item:
-                return False
+                return None
+            city_changed = item.get("city", "") != city
             item["city"] = city
             item["sender_name"] = event.get_sender_name()
             item["updated_at"] = datetime.now(self._timezone()).isoformat(timespec="seconds")
-            changed = self._apply_subscription_transport(item, self._transport_snapshot_from_event(event))
+            transport_changed = self._apply_subscription_transport(item, self._transport_snapshot_from_event(event))
+            changed = city_changed or transport_changed
         await self._persist_subscriptions()
-        return True or changed
+        return changed
 
     async def _refresh_subscription_transport_if_needed(self, event: AstrMessageEvent):
         transport = self._transport_snapshot_from_event(event)
@@ -474,9 +504,11 @@ class DailyMorningReportPlugin(
                 changed = True
         return changed
 
-    def _city_for_subscription(self, unified_msg_origin: str) -> str:
-        item = self._subscriptions.get(unified_msg_origin, {})
-        return (item.get("city") or self._default_city()).strip()
+    async def _city_for_subscription(self, unified_msg_origin: str) -> str:
+        async with self._state_lock:
+            item = self._subscriptions.get(unified_msg_origin, {})
+            city = item.get("city") if isinstance(item, dict) else ""
+        return (city or self._default_city()).strip()
 
     def _resolve_city(self, city: str) -> str:
         return city.strip() or self._default_city()

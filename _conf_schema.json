@@ -107,5 +107,11 @@
     "type": "string",
     "description": "附加在晨报末尾的自定义文本。未设置 bot_display_name 时生效",
     "default": "由 AstrBot 自动推送"
+  },
+  "custom_weather_allowed_domains": {
+    "type": "text",
+    "description": "自定义天气 API 域名白名单，每行一个域名",
+    "default": "",
+    "hint": "启用 custom 天气源时必填，例如 weather.example.com 或 api.example.com"
   }
 }

@@ -1,4 +1,4 @@
-﻿# astrbot_plugin_morning_news
+# astrbot_plugin_morning_news
 
 AstrBot 的飞书每日晨报插件，支持定时推送晨报、飞书卡片展示、纯文本回退，以及订阅、预览、新闻速览、天气查询和管理员立即群发。
 
@@ -28,6 +28,7 @@ AstrBot 的飞书每日晨报插件，支持定时推送晨报、飞书卡片展
 - `custom_weather_api_url`: 自定义天气 API 地址模板
 - `custom_weather_response_path`: 自定义天气 API JSON 字段路径
 - `custom_weather_headers`: 自定义天气 API 请求头 JSON
+- `custom_weather_allowed_domains`: 启用 custom 天气源时必填，例如 weather.example.com 或 api.example.com
 - `include_weather`: 是否包含天气
 - `include_quote`: 是否包含每日一句
 - `include_poem`: 是否包含诗词

@@ -19,6 +19,7 @@ class NewsMixin:
         if cached is not None:
             return cached
 
+        refresh_task = None
         async with self._news_cache_lock:
             cached = self._cached_news_items_from_memory()
             if cached is not None:
@@ -30,13 +31,25 @@ class NewsMixin:
                 self._news_cache = self._build_news_cache_entry(cached)
                 return self._clone_news_items(cached)
 
-            items = await self._fetch_headlines_uncached(client)
-            await self._set_news_cache(items)
-            return self._clone_news_items(items)
+            refresh_task = getattr(self, "_news_refresh_task", None)
+            if refresh_task is None or refresh_task.done():
+                refresh_task = asyncio.create_task(self._refresh_news_cache(client))
+                self._news_refresh_task = refresh_task
 
-    async def _fetch_headlines_uncached(
-        self, client: httpx.AsyncClient
-    ) -> list[dict[str, str]]:
+        try:
+            items = await refresh_task
+            return self._clone_news_items(items)
+        finally:
+            async with self._news_cache_lock:
+                if getattr(self, "_news_refresh_task", None) is refresh_task and refresh_task.done():
+                    self._news_refresh_task = None
+
+    async def _refresh_news_cache(self, client: httpx.AsyncClient) -> list[dict[str, str]]:
+        items = await self._fetch_headlines_uncached(client)
+        await self._set_news_cache(items)
+        return items
+
+    async def _fetch_headlines_uncached(self, client: httpx.AsyncClient) -> list[dict[str, str]]:
         news_limit = self._news_limit()
         items: list[dict[str, str]] = []
         seen_titles: set[str] = set()
@@ -48,7 +61,7 @@ class NewsMixin:
                 feed = feedparser.parse(response.text)
                 source = self._clean_text(feed.feed.get("title", "") or "")
             except Exception as exc:
-                logger.warning("RSS 拉取失败: url=%s error=%s", url, exc)
+                logger.warning("rss fetch failed: url=%s error=%s", url, exc)
                 continue
 
             for entry in feed.entries:
@@ -116,10 +129,7 @@ class NewsMixin:
                 "title": self._clip_text(self._clean_text(str(item.get("title", "") or "")), 80),
                 "source": self._clean_text(str(item.get("source", "") or "")),
                 "link": self._clean_text(str(item.get("link", "") or "")),
-                "summary": self._clip_text(
-                    self._clean_text(str(item.get("summary", "") or "")),
-                    240,
-                ),
+                "summary": self._clip_text(self._clean_text(str(item.get("summary", "") or "")), 240),
                 "image": self._clean_text(str(item.get("image", "") or "")),
             }
             if not normalized_item["title"] and not normalized_item["summary"]:
@@ -226,9 +236,7 @@ class NewsMixin:
         data = response.json()
 
         text = self._clean_text(data.get("hitokoto", "") or "")
-        from_name = self._clean_text(
-            data.get("from_who") or data.get("from") or data.get("creator", "") or ""
-        )
+        from_name = self._clean_text(data.get("from_who") or data.get("from") or data.get("creator", "") or "")
         if not text:
             return None
         return f"{text} - {from_name}" if from_name else text
@@ -245,11 +253,10 @@ class NewsMixin:
         if not content:
             return None
 
-        meta = "".join(
-            part
-            for part in [
-                f"《{title}》" if title else "",
-                author if author else "",
-            ]
-        )
+        meta_parts = []
+        if title:
+            meta_parts.append(f"\u300a{title}\u300b")
+        if author:
+            meta_parts.append(author)
+        meta = " ".join(meta_parts)
         return f"{content} - {meta}" if meta else content

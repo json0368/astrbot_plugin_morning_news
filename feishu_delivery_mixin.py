@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import importlib
+import inspect
 import json
 from typing import Any
 
@@ -337,6 +338,19 @@ class FeishuDeliveryMixin:
         event_cls = getattr(module, "LarkMessageEvent", None)
         return getattr(event_cls, "_send_im_message", None) if event_cls else None
 
+    def _sender_accepts_call(self, sender: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+        if not callable(sender):
+            return False
+        try:
+            signature = inspect.signature(sender)
+        except (TypeError, ValueError):
+            return True
+        try:
+            signature.bind(*args, **kwargs)
+        except TypeError:
+            return False
+        return True
+
     async def _invoke_card_sender(
         self,
         card_sender: Any,
@@ -369,11 +383,10 @@ class FeishuDeliveryMixin:
                     },
                 ),
             ):
-                try:
-                    await card_sender(*args, **kwargs)
-                    return True
-                except TypeError:
+                if not self._sender_accepts_call(card_sender, args, kwargs):
                     continue
+                await card_sender(*args, **kwargs)
+                return True
 
         if callable(im_sender):
             for args, kwargs in (
@@ -398,10 +411,9 @@ class FeishuDeliveryMixin:
                     {},
                 ),
             ):
-                try:
-                    await im_sender(*args, **kwargs)
-                    return True
-                except TypeError:
+                if not self._sender_accepts_call(im_sender, args, kwargs):
                     continue
+                await im_sender(*args, **kwargs)
+                return True
 
         return False
