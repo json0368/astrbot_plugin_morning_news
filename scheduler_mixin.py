@@ -6,10 +6,7 @@ from datetime import datetime
 
 from astrbot.api import logger
 
-try:
-    from .daily_shared import SCHEDULER_RELOAD_POLL_SECONDS
-except ImportError:
-    from daily_shared import SCHEDULER_RELOAD_POLL_SECONDS
+from .daily_shared import SCHEDULER_RELOAD_POLL_SECONDS
 
 
 class SchedulerMixin:

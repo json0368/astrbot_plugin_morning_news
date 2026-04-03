@@ -102,7 +102,8 @@ class NewsMixin:
         try:
             response = await client.get(url)
             response.raise_for_status()
-            feed = feedparser.parse(response.text)
+            loop = asyncio.get_running_loop()
+            feed = await loop.run_in_executor(None, feedparser.parse, response.text)
             source = self._clean_text(feed.feed.get("title", "") or "")
             return source, list(feed.entries)
         except Exception as exc:

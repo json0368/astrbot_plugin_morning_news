@@ -4,10 +4,7 @@ from datetime import datetime
 import re
 from typing import Any
 
-try:
-    from .daily_shared import WEEKDAY_CN
-except ImportError:
-    from daily_shared import WEEKDAY_CN
+from .daily_shared import WEEKDAY_CN
 
 
 class RenderingMixin:

@@ -1,18 +1,58 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import ipaddress
+import json
 import socket
+import ssl
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
 import httpx
 from astrbot.api import logger
 
-try:
-    from .daily_shared import WEATHER_CODE_MAP
-except ImportError:
-    from daily_shared import WEATHER_CODE_MAP
+from .daily_shared import WEATHER_CODE_MAP
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, tls_hostname: str, connect_ip: str, port: int, timeout: float):
+        context = ssl.create_default_context()
+        super().__init__(host=connect_ip, port=port, timeout=timeout, context=context)
+        self._tls_hostname = tls_hostname
+        self._connect_ip = connect_ip
+
+    def connect(self):
+        sock = socket.create_connection((self._connect_ip, self.port), self.timeout, self.source_address)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self._tls_hostname)
+
+
+class _PinnedHttpResponse:
+    def __init__(self, status_code: int, headers: dict[str, str], body: bytes):
+        self.status_code = status_code
+        self.headers = headers
+        self.text = self._decode_body(body, headers)
+
+    @staticmethod
+    def _decode_body(body: bytes, headers: dict[str, str]) -> str:
+        content_type = str(headers.get("content-type", "") or "")
+        encoding = "utf-8"
+        for part in content_type.split(";")[1:]:
+            part = part.strip()
+            if part.lower().startswith("charset="):
+                encoding = part.split("=", 1)[1].strip() or "utf-8"
+                break
+        try:
+            return body.decode(encoding, errors="replace")
+        except LookupError:
+            return body.decode("utf-8", errors="replace")
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise ValueError(f"custom weather api request failed with status {self.status_code}")
+
+    def json(self) -> Any:
+        return json.loads(self.text)
 
 
 class WeatherMixin:
@@ -42,44 +82,8 @@ class WeatherMixin:
         )
         response.raise_for_status()
         data = response.json()
-
-        location_name = (
-            self._clean_text(str(data.get("city", "") or ""))
-            or self._clean_text(str(data.get("province", "") or ""))
-            or city_name
-        )
-        weather_text = self._clean_text(str(data.get("weather", "") or "")) or "\u672a\u77e5\u5929\u6c14"
-        parts = [f"{location_name}: {weather_text}"]
-
-        temp_min_value = self._safe_float(data.get("temp_min"))
-        temp_max_value = self._safe_float(data.get("temp_max"))
-        current_temp_value = self._safe_float(data.get("temperature"))
-        humidity_text = self._text_value(data.get("humidity"))
-        wind_direction = self._clean_text(str(data.get("wind_direction", "") or ""))
-        wind_power = self._clean_text(str(data.get("wind_power", "") or ""))
-        feels_like_value = self._safe_float(data.get("feels_like"))
-        aqi_text_value = self._text_value(data.get("aqi"))
-        aqi_category = self._clean_text(str(data.get("aqi_category", "") or ""))
-
-        if temp_min_value is not None and temp_max_value is not None:
-            parts.append(f"{round(temp_min_value)}~{round(temp_max_value)}\u00b0C")
-        if current_temp_value is not None:
-            parts.append(f"\u5f53\u524d {round(current_temp_value)}\u00b0C")
-        if humidity_text:
-            parts.append(f"\u6e7f\u5ea6 {humidity_text}%")
-        if wind_direction or wind_power:
-            wind_text = " ".join(part for part in [wind_direction, wind_power] if part)
-            if wind_text:
-                parts.append(wind_text)
-        if feels_like_value is not None:
-            parts.append(f"\u4f53\u611f {round(feels_like_value)}\u00b0C")
-        if aqi_text_value:
-            aqi_text = f"AQI {aqi_text_value}"
-            if aqi_category:
-                aqi_text = f"{aqi_text} {aqi_category}"
-            parts.append(aqi_text)
-
-        return "\uff0c".join(parts)
+        fields = self._extract_uapi_weather_fields(data, city_name)
+        return self._render_weather_summary(fields)
 
     async def _fetch_open_meteo_weather_summary(self, client: httpx.AsyncClient, city_name: str) -> str | None:
         geo = await self._fetch_city_geo(client, city_name)
@@ -102,34 +106,99 @@ class WeatherMixin:
         )
         response.raise_for_status()
         data = response.json()
+        fields = self._extract_open_meteo_weather_fields(data, geo, city_name)
+        return self._render_weather_summary(fields)
 
-        current = data.get("current", {})
-        daily = data.get("daily", {})
+    def _extract_uapi_weather_fields(self, data: dict[str, Any], city_name: str) -> dict[str, Any]:
+        return {
+            "location_name": (
+                self._clean_text(str(data.get("city", "") or ""))
+                or self._clean_text(str(data.get("province", "") or ""))
+                or city_name
+            ),
+            "weather_text": self._clean_text(str(data.get("weather", "") or "")) or "????",
+            "temp_min": self._safe_float(data.get("temp_min")),
+            "temp_max": self._safe_float(data.get("temp_max")),
+            "current_temp": self._safe_float(data.get("temperature")),
+            "humidity": self._text_value(data.get("humidity")),
+            "wind_text": self._weather_wind_text(data.get("wind_direction"), data.get("wind_power")),
+            "feels_like": self._safe_float(data.get("feels_like")),
+            "aqi_text": self._text_value(data.get("aqi")),
+            "aqi_category": self._clean_text(str(data.get("aqi_category", "") or "")),
+            "rain_probability": None,
+            "sunrise": "",
+            "sunset": "",
+        }
 
+    def _extract_open_meteo_weather_fields(
+        self,
+        data: dict[str, Any],
+        geo: dict[str, Any],
+        city_name: str,
+    ) -> dict[str, Any]:
+        current = data.get("current", {}) or {}
+        daily = data.get("daily", {}) or {}
         weather_code = self._safe_int(self._first_or_default(daily.get("weather_code"), current.get("weather_code")))
-        max_temp = self._safe_float(self._first_or_default(daily.get("temperature_2m_max")))
-        min_temp = self._safe_float(self._first_or_default(daily.get("temperature_2m_min")))
-        rain_prob_value = self._safe_float(self._first_or_default(daily.get("precipitation_probability_max")))
-        sunrise = self._format_time(self._first_or_default(daily.get("sunrise"), ""))
-        sunset = self._format_time(self._first_or_default(daily.get("sunset"), ""))
-        current_temp = self._safe_float(current.get("temperature_2m"))
+        return {
+            "location_name": geo.get("display_name") or city_name,
+            "weather_text": WEATHER_CODE_MAP.get(weather_code, "????") if weather_code is not None else "????",
+            "temp_min": self._safe_float(self._first_or_default(daily.get("temperature_2m_min"))),
+            "temp_max": self._safe_float(self._first_or_default(daily.get("temperature_2m_max"))),
+            "current_temp": self._safe_float(current.get("temperature_2m")),
+            "humidity": "",
+            "wind_text": "",
+            "feels_like": None,
+            "aqi_text": "",
+            "aqi_category": "",
+            "rain_probability": self._safe_float(self._first_or_default(daily.get("precipitation_probability_max"))),
+            "sunrise": self._format_time(self._first_or_default(daily.get("sunrise"), "")),
+            "sunset": self._format_time(self._first_or_default(daily.get("sunset"), "")),
+        }
 
-        location_name = geo.get("display_name") or city_name
-        weather_text = WEATHER_CODE_MAP.get(weather_code, "\u672a\u77e5\u5929\u6c14") if weather_code is not None else "\u672a\u77e5\u5929\u6c14"
+    def _render_weather_summary(self, fields: dict[str, Any]) -> str:
+        location_name = str(fields.get("location_name") or "").strip()
+        weather_text = str(fields.get("weather_text") or "????").strip() or "????"
         parts = [f"{location_name}: {weather_text}"]
 
-        if min_temp is not None and max_temp is not None:
-            parts.append(f"{round(min_temp)}~{round(max_temp)}\u00b0C")
-        if current_temp is not None:
-            parts.append(f"\u5f53\u524d {round(current_temp)}\u00b0C")
-        if rain_prob_value is not None:
-            parts.append(f"\u964d\u6c34\u6982\u7387 {round(rain_prob_value)}%")
-        if sunrise:
-            parts.append(f"\u65e5\u51fa {sunrise}")
-        if sunset:
-            parts.append(f"\u65e5\u843d {sunset}")
+        temp_min = fields.get("temp_min")
+        temp_max = fields.get("temp_max")
+        current_temp = fields.get("current_temp")
+        humidity = str(fields.get("humidity") or "").strip()
+        wind_text = str(fields.get("wind_text") or "").strip()
+        feels_like = fields.get("feels_like")
+        rain_probability = fields.get("rain_probability")
+        sunrise = str(fields.get("sunrise") or "").strip()
+        sunset = str(fields.get("sunset") or "").strip()
+        aqi_text = str(fields.get("aqi_text") or "").strip()
+        aqi_category = str(fields.get("aqi_category") or "").strip()
 
-        return "\uff0c".join(parts)
+        if temp_min is not None and temp_max is not None:
+            parts.append(f"{round(temp_min)}~{round(temp_max)}?C")
+        if current_temp is not None:
+            parts.append(f"?? {round(current_temp)}?C")
+        if humidity:
+            parts.append(f"?? {humidity}%")
+        if wind_text:
+            parts.append(wind_text)
+        if feels_like is not None:
+            parts.append(f"?? {round(feels_like)}?C")
+        if rain_probability is not None:
+            parts.append(f"???? {round(rain_probability)}%")
+        if sunrise:
+            parts.append(f"?? {sunrise}")
+        if sunset:
+            parts.append(f"?? {sunset}")
+        if aqi_text:
+            aqi_summary = f"AQI {aqi_text}"
+            if aqi_category:
+                aqi_summary = f"{aqi_summary} {aqi_category}"
+            parts.append(aqi_summary)
+        return "?".join(parts)
+
+    def _weather_wind_text(self, direction: Any, power: Any) -> str:
+        wind_direction = self._clean_text(str(direction or ""))
+        wind_power = self._clean_text(str(power or ""))
+        return " ".join(part for part in (wind_direction, wind_power) if part)
 
     async def _fetch_custom_weather_summary(self, client: httpx.AsyncClient, city_name: str) -> str | None:
         template = self._custom_weather_api_url()
@@ -149,13 +218,11 @@ class WeatherMixin:
             "display_name": city_name if not geo else str(geo.get("display_name") or city_name),
         }
         request_url = self._fill_url_template(template, values)
-        await self._validate_custom_weather_url(request_url)
-
-        response = await client.get(
-            request_url,
-            headers=self._custom_weather_headers(),
-            follow_redirects=False,
-        )
+        target = await self._validate_custom_weather_url(request_url)
+        headers = self._custom_weather_headers()
+        if str(getattr(self, "config", {}).get("http_proxy", "") or "").strip():
+            logger.warning("custom weather pinned request ignores http_proxy to prevent DNS rebinding: host=%s", target["hostname"])
+        response = await self._fetch_pinned_custom_weather_response(request_url, headers, target)
         response.raise_for_status()
 
         response_path = self._custom_weather_response_path()
@@ -176,6 +243,68 @@ class WeatherMixin:
 
         text = self._clean_text(response.text)
         return self._clip_text(text, 300) if text else None
+
+    async def _fetch_pinned_custom_weather_response(
+        self,
+        request_url: str,
+        headers: dict[str, str],
+        target: dict[str, Any],
+    ) -> _PinnedHttpResponse:
+        return await asyncio.to_thread(
+            self._perform_pinned_https_get,
+            request_url,
+            headers,
+            target,
+            self._custom_weather_timeout_seconds(),
+        )
+
+    def _perform_pinned_https_get(
+        self,
+        request_url: str,
+        headers: dict[str, str],
+        target: dict[str, Any],
+        timeout: int,
+    ) -> _PinnedHttpResponse:
+        del request_url
+        connection = _PinnedHTTPSConnection(
+            tls_hostname=target["hostname"],
+            connect_ip=target["resolved_ip"],
+            port=int(target["port"]),
+            timeout=float(timeout),
+        )
+        request_headers = self._sanitize_pinned_request_headers(headers)
+        try:
+            connection.putrequest("GET", str(target["request_path"]), skip_host=True, skip_accept_encoding=True)
+            connection.putheader("Host", str(target["hostname"]))
+            connection.putheader("Accept", "*/*")
+            connection.putheader("Accept-Encoding", "identity")
+            connection.putheader("Connection", "close")
+            for name, value in request_headers.items():
+                connection.putheader(name, value)
+            connection.endheaders()
+            response = connection.getresponse()
+            body = response.read()
+            response_headers = {key.lower(): value for key, value in response.getheaders()}
+            return _PinnedHttpResponse(response.status, response_headers, body)
+        finally:
+            connection.close()
+
+    def _custom_weather_timeout_seconds(self) -> int:
+        config = getattr(self, "config", {}) or {}
+        return max(int(config.get("http_timeout_seconds", 15) or 15), 5)
+
+    @staticmethod
+    def _sanitize_pinned_request_headers(headers: dict[str, str]) -> dict[str, str]:
+        sanitized: dict[str, str] = {}
+        for name, value in (headers or {}).items():
+            key = str(name or "").strip()
+            if not key:
+                continue
+            lowered = key.lower()
+            if lowered in {"host", "connection", "accept-encoding", "content-length"}:
+                continue
+            sanitized[key] = str(value)
+        return sanitized
 
     def _custom_weather_allowed_domains(self) -> set[str]:
         config = getattr(self, "config", {}) or {}
@@ -219,7 +348,7 @@ class WeatherMixin:
         ):
             raise ValueError(f"custom weather api cannot target local/private IP: {ip}")
 
-    async def _validate_custom_weather_url(self, request_url: str):
+    async def _validate_custom_weather_url(self, request_url: str) -> dict[str, Any]:
         parsed = urlparse(str(request_url or "").strip())
         if parsed.scheme != "https" or not parsed.hostname:
             raise ValueError("custom weather api url must use https and include a hostname")
@@ -236,6 +365,7 @@ class WeatherMixin:
         if not self._hostname_allowed(hostname, allowed_domains):
             raise ValueError(f"custom weather api hostname is not allowlisted: {hostname}")
 
+        resolved_ips: set[str]
         try:
             ipaddress.ip_address(hostname)
         except ValueError:
@@ -249,6 +379,22 @@ class WeatherMixin:
                 self._ensure_public_ip(ip_text)
         else:
             self._ensure_public_ip(hostname)
+            resolved_ips = {hostname}
+
+        resolved_ip = sorted(resolved_ips)[0]
+        return {
+            "hostname": hostname,
+            "port": parsed.port or 443,
+            "resolved_ip": resolved_ip,
+            "request_path": self._request_path_from_url(parsed),
+        }
+
+    @staticmethod
+    def _request_path_from_url(parsed) -> str:
+        path = parsed.path or "/"
+        if parsed.query:
+            return f"{path}?{parsed.query}"
+        return path
 
     async def _fetch_city_geo(self, client: httpx.AsyncClient, city_name: str) -> dict[str, Any] | None:
         cache_key = city_name.strip().casefold()

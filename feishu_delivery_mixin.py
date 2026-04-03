@@ -9,6 +9,9 @@ from astrbot.api import logger
 from astrbot.api.event import MessageChain
 
 
+_LARK_IM_V1_MODULE: Any | None = None
+
+
 class FeishuDeliveryMixin:
     async def _deliver_payload_to_event(self, event: Any, payload: dict[str, Any]) -> Any | None:
         if self._payload_has_card(payload) and self._is_feishu_event(event):
@@ -390,10 +393,20 @@ class FeishuDeliveryMixin:
         return create_message if callable(create_message) else None
 
     @staticmethod
-    def _build_lark_card_request(receive_id: str, receive_id_type: str, card: dict[str, Any]) -> Any | None:
+    def _load_lark_im_v1_module() -> Any | None:
+        global _LARK_IM_V1_MODULE
+        if _LARK_IM_V1_MODULE is not None:
+            return _LARK_IM_V1_MODULE
         try:
-            module = importlib.import_module("lark_oapi.api.im.v1")
+            _LARK_IM_V1_MODULE = importlib.import_module("lark_oapi.api.im.v1")
         except Exception:
+            return None
+        return _LARK_IM_V1_MODULE
+
+    @staticmethod
+    def _build_lark_card_request(receive_id: str, receive_id_type: str, card: dict[str, Any]) -> Any | None:
+        module = FeishuDeliveryMixin._load_lark_im_v1_module()
+        if module is None:
             return None
 
         request_cls = getattr(module, "CreateMessageRequest", None)
