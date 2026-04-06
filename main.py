@@ -5,6 +5,7 @@ import html
 import json
 import re
 from collections import OrderedDict
+from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -49,16 +50,57 @@ class DailyMorningReportPlugin(
         self._news_cache_lock = asyncio.Lock()
         self._news_refresh_task: asyncio.Task | None = None
         self._scheduler_task: asyncio.Task | None = None
+        self._runtime_boot_task: asyncio.Task | None = None
+        self._runtime_start_lock = asyncio.Lock()
+        self._subscriptions_loaded = False
+        self._startup_catchup_checked = False
+        self._schedule_runtime_bootstrap()
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        await self._load_subscriptions()
-        await self._maybe_send_startup_catchup()
-        self._start_scheduler()
+        await self._ensure_runtime_started(run_startup_catchup=True)
 
     async def terminate(self):
+        await self._cancel_runtime_boot_task()
         await self._stop_scheduler()
         await self._cancel_news_refresh_task()
+
+    def _schedule_runtime_bootstrap(self):
+        if self.context is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._runtime_boot_task and not self._runtime_boot_task.done():
+            return
+        self._runtime_boot_task = loop.create_task(self._bootstrap_runtime())
+
+    async def _bootstrap_runtime(self):
+        try:
+            await self._ensure_runtime_started(run_startup_catchup=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("????????????: %s", exc)
+
+    async def _cancel_runtime_boot_task(self):
+        if self._runtime_boot_task and not self._runtime_boot_task.done():
+            self._runtime_boot_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._runtime_boot_task
+
+    async def _ensure_runtime_started(self, *, run_startup_catchup: bool = False):
+        async with self._runtime_start_lock:
+            if not self._subscriptions_loaded:
+                await self._load_subscriptions()
+                self._subscriptions_loaded = True
+            if run_startup_catchup and not self._startup_catchup_checked:
+                try:
+                    await self._maybe_send_startup_catchup()
+                finally:
+                    self._startup_catchup_checked = True
+            self._start_scheduler()
 
     @filter.command_group("daily")
     def daily(self):
@@ -75,6 +117,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _subscribe_impl(self, event: AstrMessageEvent, city: str = ""):
+        await self._ensure_runtime_started()
         await self._upsert_subscription(event, city.strip())
         effective_city = self._resolve_city(city.strip())
         yield event.plain_result(
@@ -95,6 +138,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _unsubscribe_impl(self, event: AstrMessageEvent):
+        await self._ensure_runtime_started()
         removed = await self._remove_subscription(event.unified_msg_origin)
         if removed:
             yield event.plain_result("已取消当前会话的每日晨报订阅。")
@@ -107,6 +151,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _set_city_impl(self, event: AstrMessageEvent, city: str):
+        await self._ensure_runtime_started()
         city = city.strip()
         if not city:
             yield event.plain_result("天气城市不能为空，请使用 `/daily city 城市名`。")
@@ -124,6 +169,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _preview_impl(self, event: AstrMessageEvent, city: str = ""):
+        await self._ensure_runtime_started()
         await self._refresh_subscription_transport_if_needed(event)
         resolved_city = city.strip() or await self._city_for_subscription(event.unified_msg_origin)
         payload = await self._build_report_payload(resolved_city)
@@ -137,6 +183,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _news_impl(self, event: AstrMessageEvent):
+        await self._ensure_runtime_started()
         await self._refresh_subscription_transport_if_needed(event)
         payload = await self._build_news_payload()
         result = await self._deliver_payload_to_event(event, payload)
@@ -149,6 +196,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _weather_impl(self, event: AstrMessageEvent, city: str = ""):
+        await self._ensure_runtime_started()
         await self._refresh_subscription_transport_if_needed(event)
         resolved_city = city.strip() or await self._city_for_subscription(event.unified_msg_origin)
         if not resolved_city:
@@ -179,6 +227,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _status_impl(self, event: AstrMessageEvent):
+        await self._ensure_runtime_started()
         await self._refresh_subscription_transport_if_needed(event)
         status_data = await self._build_status_data(event)
         payload = self._build_status_payload(status_data)
@@ -193,6 +242,7 @@ class DailyMorningReportPlugin(
             yield result
 
     async def _help_impl(self, event: AstrMessageEvent):
+        await self._ensure_runtime_started()
         payload = self._build_help_payload()
         result = await self._deliver_payload_to_event(event, payload)
         if result is not None:
@@ -221,6 +271,7 @@ class DailyMorningReportPlugin(
         )
 
     async def _sendnow_impl(self, event: AstrMessageEvent):
+        await self._ensure_runtime_started()
         success_count = await self._broadcast_daily_report(reason="manual")
         yield event.plain_result(f"晨报已尝试发送，成功投递到 {success_count} 个会话。")
 
@@ -398,7 +449,7 @@ class DailyMorningReportPlugin(
 
     def _http_client(self) -> httpx.AsyncClient:
         proxy = str(self.config.get("http_proxy", "") or "").strip() or None
-        timeout = max(int(self.config.get("http_timeout_seconds", 15) or 15), 5)
+        timeout = self._http_timeout_seconds()
         kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
@@ -419,6 +470,7 @@ class DailyMorningReportPlugin(
         normalized = self._normalize_subscriptions(data)
         async with self._state_lock:
             self._subscriptions = normalized
+        self._subscriptions_loaded = True
 
     def _normalize_subscriptions(self, data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         normalized: dict[str, dict[str, Any]] = {}
@@ -626,8 +678,30 @@ class DailyMorningReportPlugin(
         return [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
 
     def _news_limit(self) -> int:
-        value = int(self.config.get("news_limit", 5) or 5)
-        return max(value, 0)
+        return self._int_config("news_limit", 5, minimum=0)
+
+    def _http_timeout_seconds(self) -> int:
+        return self._int_config("http_timeout_seconds", 15, minimum=5)
+
+    def _int_config(
+        self,
+        key: str,
+        default: int,
+        *,
+        minimum: int | None = None,
+        maximum: int | None = None,
+    ) -> int:
+        raw = self.config.get(key, default)
+        try:
+            value = int(raw or default)
+        except (TypeError, ValueError):
+            logger.warning("%s ????: %s????? %s", key, raw, default)
+            value = default
+        if minimum is not None:
+            value = max(value, minimum)
+        if maximum is not None:
+            value = min(value, maximum)
+        return value
 
     def _is_enabled(self) -> bool:
         return bool(self.config.get("enabled", True))

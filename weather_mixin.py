@@ -290,8 +290,18 @@ class WeatherMixin:
             connection.close()
 
     def _custom_weather_timeout_seconds(self) -> int:
+        timeout_reader = getattr(self, "_http_timeout_seconds", None)
+        if callable(timeout_reader):
+            return timeout_reader()
+
         config = getattr(self, "config", {}) or {}
-        return max(int(config.get("http_timeout_seconds", 15) or 15), 5)
+        raw = config.get("http_timeout_seconds", 15)
+        try:
+            value = int(raw or 15)
+        except (TypeError, ValueError):
+            logger.warning("http_timeout_seconds ????: %s????? 15", raw)
+            value = 15
+        return max(value, 5)
 
     def _dns_resolution_timeout_seconds(self) -> int:
         return max(1, min(self._custom_weather_timeout_seconds(), 10))

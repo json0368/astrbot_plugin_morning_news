@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlsplit, urlunsplit
 
 
 class CardRenderingMixin:
@@ -276,13 +276,22 @@ class CardRenderingMixin:
         return value
 
     def _safe_card_link(self, url: str) -> str:
+        sanitizer = getattr(self, "_safe_markdown_link_url", None)
+        if callable(sanitizer):
+            return sanitizer(url)
+
         value = str(url or "").strip()
         if not value:
             return ""
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
             return ""
-        return value.replace("(", "%28").replace(")", "%29")
+        if any(char.isspace() for char in parts.netloc):
+            return ""
+        path = quote(parts.path or "/", safe="/%:@!$&'*+,;=-._~")
+        query = quote(parts.query, safe="=&%:@!$'*,;+-._~")
+        fragment = quote(parts.fragment, safe="%:@!$&'*,;=+-._~")
+        return urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
 
     @staticmethod
     def _build_card(title: str, template: str, elements: list[dict[str, Any]]) -> dict[str, Any]:

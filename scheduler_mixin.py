@@ -65,6 +65,8 @@ class SchedulerMixin:
             await asyncio.sleep(min(remaining, SCHEDULER_RELOAD_POLL_SECONDS))
 
     async def _maybe_send_startup_catchup(self):
+        if not self._is_enabled():
+            return
         if not self.config.get("send_startup_catchup", False):
             return
 
